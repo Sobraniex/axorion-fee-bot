@@ -1,23 +1,19 @@
 """
 Solana fee-wallet notifier — a Telegram bot.
 
-A user gives the bot a Solana wallet address. The bot watches that wallet, and
-whenever the wallet RECEIVES SOL (i.e. it "takes the fee"), everyone subscribed
-to that wallet gets a Telegram notification with the amount and a Solscan link.
+Give the bot a Solana wallet address. The bot watches that wallet, and whenever
+the wallet RECEIVES SOL (i.e. it "takes the fee"), everyone subscribed to that
+wallet gets a Telegram notification with the amount and a Solscan link.
 
-Detection is intentionally simple and chain-honest: for every new transaction
-that touches a tracked wallet, we compute the wallet's net SOL balance change
+Two ways to use it:
+  • Tap buttons (normie-friendly menu) — just send /start.
+  • Type slash commands (for power users): /track, /untrack, /list, /help.
+
+Detection is simple and chain-honest: for every new transaction that touches a
+tracked wallet, we compute the wallet's net SOL balance change
 (postBalance - preBalance). A positive change = the wallet got paid = fee taken.
-
-Commands:
-  /start            – intro
-  /track <wallet>   – start watching a wallet in this chat
-  /untrack <wallet> – stop watching it here
-  /list             – wallets watched in this chat
-  /help             – help
 """
 
-import asyncio
 import json
 import logging
 import os
@@ -25,12 +21,15 @@ from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 
 load_dotenv()
@@ -70,6 +69,44 @@ def save_db(db: dict) -> None:
     DB_PATH.write_text(json.dumps(db, indent=2))
 
 
+def wallets_for_chat(db: dict, chat_id: int) -> list:
+    return [w for w, info in db.items() if chat_id in info["subscribers"]]
+
+
+def short(wallet: str) -> str:
+    return f"{wallet[:4]}…{wallet[-4:]}"
+
+
+def looks_like_wallet(s: str) -> bool:
+    # Base58, 32–44 chars. Good enough to reject obvious junk.
+    return 32 <= len(s) <= 44 and s.isalnum() and all(c not in "0OIl" for c in s)
+
+
+# --------------------------------------------------------------------------- #
+# Subscription logic (pure-ish, so it's easy to test)
+# --------------------------------------------------------------------------- #
+def add_subscription(chat_id: int, wallet: str) -> str:
+    db = load_db()
+    entry = db.setdefault(wallet, {"subscribers": [], "last_sig": None})
+    if chat_id in entry["subscribers"]:
+        return "already"
+    entry["subscribers"].append(chat_id)
+    save_db(db)
+    return "added"
+
+
+def remove_subscription(chat_id: int, wallet: str) -> str:
+    db = load_db()
+    entry = db.get(wallet)
+    if not entry or chat_id not in entry["subscribers"]:
+        return "missing"
+    entry["subscribers"].remove(chat_id)
+    if not entry["subscribers"]:
+        db.pop(wallet)  # nobody cares anymore — stop polling it
+    save_db(db)
+    return "removed"
+
+
 # --------------------------------------------------------------------------- #
 # Solana RPC helpers
 # --------------------------------------------------------------------------- #
@@ -91,28 +128,30 @@ async def get_recent_signatures(client, wallet, limit=25):
     return await rpc(client, "getSignaturesForAddress", [wallet, {"limit": limit}])
 
 
-async def get_sol_delta(client, signature, wallet):
+def sol_delta_from_tx(tx: dict, wallet: str) -> float:
     """
-    Net SOL change for `wallet` in this transaction.
-    Positive  -> wallet received SOL (took a fee / got paid).
+    Pure function: net SOL change for `wallet` given a getTransaction result.
+    Positive -> wallet received SOL. Separated out so it can be unit-tested.
     """
-    tx = await rpc(
-        client,
-        "getTransaction",
-        [signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}],
-    )
     if not tx or not tx.get("meta"):
         return 0.0
-
     keys = tx["transaction"]["message"]["accountKeys"]
     pre = tx["meta"]["preBalances"]
     post = tx["meta"]["postBalances"]
-
     for i, key in enumerate(keys):
         pubkey = key["pubkey"] if isinstance(key, dict) else key
         if pubkey == wallet and i < len(pre) and i < len(post):
             return (post[i] - pre[i]) / LAMPORTS_PER_SOL
     return 0.0
+
+
+async def get_sol_delta(client, signature, wallet):
+    tx = await rpc(
+        client,
+        "getTransaction",
+        [signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}],
+    )
+    return sol_delta_from_tx(tx, wallet)
 
 
 # --------------------------------------------------------------------------- #
@@ -140,7 +179,7 @@ async def poll_wallets(context: ContextTypes.DEFAULT_TYPE):
                     break
                 fresh.append(s)
 
-            # First time we see this wallet: just set a baseline, don't replay history.
+            # First time we see this wallet: set a baseline, don't replay history.
             if last_seen is None:
                 info["last_sig"] = sigs[0]["signature"]
                 continue
@@ -154,7 +193,6 @@ async def poll_wallets(context: ContextTypes.DEFAULT_TYPE):
                 except Exception as e:  # noqa: BLE001
                     log.warning("tx fetch failed %s: %s", s["signature"], e)
                     continue
-
                 if delta > MIN_SOL and delta > 0:
                     await notify(context, info["subscribers"], wallet, delta, s["signature"])
 
@@ -164,10 +202,9 @@ async def poll_wallets(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def notify(context, subscribers, wallet, amount, signature):
-    short = f"{wallet[:4]}…{wallet[-4:]}"
     text = (
         f"💰 *Fee collected*\n"
-        f"Wallet `{short}` just received *{amount:.6f} SOL*\n\n"
+        f"Wallet `{short(wallet)}` just received *{amount:.6f} SOL*\n\n"
         f"[View transaction](https://solscan.io/tx/{signature})"
     )
     for chat_id in subscribers:
@@ -183,109 +220,155 @@ async def notify(context, subscribers, wallet, amount, signature):
 
 
 # --------------------------------------------------------------------------- #
+# UI — buttons
+# --------------------------------------------------------------------------- #
+def main_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("➕ Track a wallet", callback_data="track")],
+            [InlineKeyboardButton("📋 My wallets", callback_data="list")],
+            [InlineKeyboardButton("❓ Help", callback_data="help")],
+        ]
+    )
+
+
+WELCOME = (
+    "👋 *Solana Fee Notifier*\n\n"
+    "I watch Solana wallets and ping you the moment one *receives SOL* "
+    "(i.e. takes a fee).\n\n"
+    "Tap a button below, or type `/track <wallet>`."
+)
+
+HELP_TEXT = (
+    "*How it works*\n"
+    "1. Give me a wallet address.\n"
+    "2. I check it every ~30s.\n"
+    "3. When it receives SOL, you get a 💰 alert with the amount + a link.\n\n"
+    "*Buttons*\n"
+    "➕ Track a wallet — then paste the address\n"
+    "📋 My wallets — see / remove what you watch\n\n"
+    "*Commands (optional)*\n"
+    "`/track <wallet>`  `/untrack <wallet>`  `/list`"
+)
+
+
+# --------------------------------------------------------------------------- #
 # Command handlers
 # --------------------------------------------------------------------------- #
-def looks_like_wallet(s: str) -> bool:
-    # Base58, 32–44 chars. Good enough to reject obvious junk.
-    return 32 <= len(s) <= 44 and all(
-        c not in "0OIl" for c in s
-    ) and s.isalnum()
-
-
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 I watch Solana wallets and ping you when one *receives* SOL "
-        "(i.e. takes a fee).\n\n"
-        "Use `/track <wallet_address>` to start.\n"
-        "`/help` for everything else.",
-        parse_mode=ParseMode.MARKDOWN,
+        WELCOME, parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu()
     )
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "*Commands*\n"
-        "`/track <wallet>` – watch a wallet in this chat\n"
-        "`/untrack <wallet>` – stop watching it here\n"
-        "`/list` – wallets watched in this chat\n",
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.MARKDOWN)
 
 
 async def cmd_track(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Usage: `/track <wallet_address>`",
-                                        parse_mode=ParseMode.MARKDOWN)
+        context.user_data["awaiting_wallet"] = True
+        await update.message.reply_text("Paste the Solana wallet address you want to watch 👇")
         return
-    wallet = context.args[0].strip()
-    if not looks_like_wallet(wallet):
-        await update.message.reply_text("That doesn't look like a Solana address. 🤔")
-        return
-
-    chat_id = update.effective_chat.id
-    db = load_db()
-    entry = db.setdefault(wallet, {"subscribers": [], "last_sig": None})
-    if chat_id in entry["subscribers"]:
-        await update.message.reply_text("Already watching that wallet here. ✅")
-        return
-    entry["subscribers"].append(chat_id)
-    save_db(db)
-    await update.message.reply_text(
-        f"🔭 Now watching `{wallet[:4]}…{wallet[-4:]}`.\n"
-        "I'll ping you when it receives SOL.",
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    await do_track(update.effective_chat.id, context.args[0].strip(),
+                   lambda t, **k: update.message.reply_text(t, **k))
 
 
 async def cmd_untrack(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Usage: `/untrack <wallet_address>`",
-                                        parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text("Usage: `/untrack <wallet>`", parse_mode=ParseMode.MARKDOWN)
         return
-    wallet = context.args[0].strip()
-    chat_id = update.effective_chat.id
-    db = load_db()
-    entry = db.get(wallet)
-    if not entry or chat_id not in entry["subscribers"]:
-        await update.message.reply_text("You weren't watching that one here.")
-        return
-    entry["subscribers"].remove(chat_id)
-    if not entry["subscribers"]:
-        db.pop(wallet)  # nobody cares anymore — stop polling it
-    save_db(db)
-    await update.message.reply_text("🛑 Stopped watching it here.")
+    res = remove_subscription(update.effective_chat.id, context.args[0].strip())
+    msg = {"removed": "🛑 Stopped watching it.", "missing": "You weren't watching that one here."}[res]
+    await update.message.reply_text(msg)
 
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    db = load_db()
-    mine = [w for w, info in db.items() if chat_id in info["subscribers"]]
-    if not mine:
-        await update.message.reply_text("You're not watching any wallets here yet.")
+    await send_wallet_list(update.effective_chat.id,
+                           lambda t, **k: update.message.reply_text(t, **k))
+
+
+# --------------------------------------------------------------------------- #
+# Shared helpers used by both buttons and commands
+# --------------------------------------------------------------------------- #
+async def do_track(chat_id, wallet, reply):
+    if not looks_like_wallet(wallet):
+        await reply("That doesn't look like a Solana address. 🤔 Try again.")
         return
-    lines = "\n".join(f"• `{w}`" for w in mine)
-    await update.message.reply_text(f"*Watching here:*\n{lines}",
-                                    parse_mode=ParseMode.MARKDOWN)
+    res = add_subscription(chat_id, wallet)
+    if res == "already":
+        await reply("Already watching that wallet. ✅")
+    else:
+        await reply(f"🔭 Now watching `{short(wallet)}`.\nI'll ping you when it receives SOL.",
+                    parse_mode=ParseMode.MARKDOWN)
+
+
+async def send_wallet_list(chat_id, reply):
+    db = load_db()
+    mine = wallets_for_chat(db, chat_id)
+    if not mine:
+        await reply("You're not watching any wallets yet.\nTap ➕ to add one.",
+                    reply_markup=main_menu())
+        return
+    rows = [[InlineKeyboardButton(f"🗑 Remove {short(w)}", callback_data=f"rm:{w}")] for w in mine]
+    rows.append([InlineKeyboardButton("➕ Track another", callback_data="track")])
+    await reply("*Wallets you're watching:*", parse_mode=ParseMode.MARKDOWN,
+                reply_markup=InlineKeyboardMarkup(rows))
+
+
+# --------------------------------------------------------------------------- #
+# Button (callback) + free-text handlers
+# --------------------------------------------------------------------------- #
+async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    chat_id = query.message.chat.id
+
+    if data == "track":
+        context.user_data["awaiting_wallet"] = True
+        await query.message.reply_text("Paste the Solana wallet address you want to watch 👇")
+    elif data == "list":
+        await send_wallet_list(chat_id, query.message.reply_text)
+    elif data == "help":
+        await query.message.reply_text(HELP_TEXT, parse_mode=ParseMode.MARKDOWN)
+    elif data.startswith("rm:"):
+        wallet = data[3:]
+        remove_subscription(chat_id, wallet)
+        await query.edit_message_text(f"🛑 Stopped watching `{short(wallet)}`.",
+                                      parse_mode=ParseMode.MARKDOWN)
+
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Catches a pasted address right after the user taps ➕ Track."""
+    if context.user_data.get("awaiting_wallet"):
+        context.user_data["awaiting_wallet"] = False
+        await do_track(update.effective_chat.id, update.message.text.strip(),
+                       update.message.reply_text)
+    else:
+        await update.message.reply_text("Tap a button or send /start.", reply_markup=main_menu())
 
 
 # --------------------------------------------------------------------------- #
 # Entry point
 # --------------------------------------------------------------------------- #
-def main():
-    if not TOKEN:
-        raise SystemExit("Set TELEGRAM_BOT_TOKEN in your environment / .env file.")
-
+def build_app() -> Application:
     app = Application.builder().token(TOKEN).build()
-
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("track", cmd_track))
     app.add_handler(CommandHandler("untrack", cmd_untrack))
     app.add_handler(CommandHandler("list", cmd_list))
-
-    # Poll wallets on a repeating job.
+    app.add_handler(CallbackQueryHandler(on_button))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.job_queue.run_repeating(poll_wallets, interval=POLL_INTERVAL, first=5)
+    return app
 
+
+def main():
+    if not TOKEN:
+        raise SystemExit("Set TELEGRAM_BOT_TOKEN in your environment / .env file.")
+    app = build_app()
     log.info("Bot started. Polling every %ss against %s", POLL_INTERVAL, RPC_URL)
     app.run_polling()
 

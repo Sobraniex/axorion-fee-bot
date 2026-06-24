@@ -4,11 +4,24 @@ Give the bot a Solana wallet address. Whenever that wallet **receives SOL**
 (i.e. "takes the fee"), everyone subscribed to it gets a Telegram ping with the
 amount and a Solscan link.
 
+**Normie-friendly:** it has tap **buttons** (➕ Track, 📋 My wallets, 🗑 Remove) —
+no need to memorise commands. See the plain-language whitepapers:
+[English](WHITEPAPER_EN.md) · [Slovenščina](WHITEPAPER_SL.md).
+
 ## How it works
 
 A background job polls each tracked wallet's recent transactions. For every new
 transaction it computes the wallet's net SOL change (`postBalance - preBalance`).
 A positive change means the wallet got paid → notification fires.
+
+## Tests
+
+```bash
+python test_bot.py
+```
+Covers address validation, the SOL-delta fee-detection math, subscription
+add/remove, and that the buttons + commands are wired up. The detection logic
+was also live-checked against Solana mainnet.
 
 ## Setup
 
