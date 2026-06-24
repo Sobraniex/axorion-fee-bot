@@ -106,6 +106,15 @@ def test_detects_bonding_curve_creator_fee_claim():
     assert amount == 0.25
 
 
+def test_detects_bonding_curve_v2_creator_fee_claim():
+    wallet = "GThUX1Atko4tqhN2NaiTazWSeFWMuiUvfFnyJyUghFMJ"
+    tx = _pump_tx("cf118af204221338", bot.PUMP_BONDING_PROGRAM, wallet,
+                  1_000_000_000, 1_100_000_000)  # +0.1 SOL, collect_creator_fee_v2
+    amount, kind = bot.detect_fee_claim(tx, wallet)
+    assert kind == "bonding curve"
+    assert amount == 0.1
+
+
 def test_ignores_plain_sol_transfer_not_a_fee_claim():
     # SOL arrives, but NO pump.fun fee instruction -> must NOT fire.
     wallet = "GThUX1Atko4tqhN2NaiTazWSeFWMuiUvfFnyJyUghFMJ"

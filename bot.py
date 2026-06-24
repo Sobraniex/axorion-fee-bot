@@ -52,12 +52,15 @@ PUMP_BONDING_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 PUMP_AMM_PROGRAM = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
 PUMP_PROGRAMS = {PUMP_BONDING_PROGRAM, PUMP_AMM_PROGRAM}
 
-# discriminator bytes -> human label
+# discriminator bytes -> human label. Values taken straight from pump's
+# official IDLs (pump-fun/pump-public-docs) and verified against real
+# mainnet claims.
 #   collect_coin_creator_fee  (PumpSwap AMM, migrated coins)
-#   collect_creator_fee       (bonding curve, pre-migration coins)
+#   collect_creator_fee[_v2]  (bonding curve, pre-migration coins)
 FEE_DISCRIMINATORS = {
     bytes.fromhex("a039592ab58b2b42"): "PumpSwap AMM",
     bytes.fromhex("1416567bc61cdb84"): "bonding curve",
+    bytes.fromhex("cf118af204221338"): "bonding curve",  # collect_creator_fee_v2
 }
 
 _B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
