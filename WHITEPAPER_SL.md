@@ -15,7 +15,7 @@ osvežuješ block explorer. To je nadležno in stvari ti uidejo mimo.
 Botu daš naslov denarnice. Od tega trenutka naprej **takoj, ko ta denarnica
 prejme SOL, ti zazvoni telefon** s Telegram sporočilom, kot je:
 
-> 💰 **Provizija pobrana**
+> 💰 **Provizija ustvarjalca pobrana** (pump.fun · PumpSwap AMM)
 > Denarnica `4Nd1…x9Qd` je pravkar prejela **0,842000 SOL**
 > [Poglej transakcijo](https://solscan.io)
 
@@ -33,15 +33,19 @@ Bot naredi to, kar bi naredil skrben pomočnik:
    naslov).
 2. **Vsakih ~30 sekund** bot pogleda zadnjo aktivnost te denarnice v javnem
    zapisu Solane.
-3. Za vsako novo transakcijo naredi en preprost izračun:
-   *"Koliko SOL je imela ta denarnica prej in koliko potem?"*
-   - Več kot prej → **denar je prišel noter** → to je pobrana provizija.
-   - Enako ali manj → ni kaj poročati, bot je tiho.
-4. Če je denar prišel noter, ti **pošlje Telegram sporočilo** s točnim zneskom in
-   povezavo do potrdila (transakcija na Solscanu).
+3. Za vsako novo transakcijo si zastavi dve vprašanji:
+   - *"Je to pump.fun dejanje 'poberi provizijo ustvarjalca'?"* (prepozna točno
+     to navodilo — tako za novejše "diplomirane" kovance na PumpSwapu kot za
+     starejše kovance na bonding curve), **in**
+   - *"Je SOL te denarnice posledično narasel?"*
+   - Oboje da → ustvarjalec je pravkar pobral provizijo.
+   - Sicer → bot je tiho (običajen nakup, prodaja ali naključno nakazilo se
+     ignorira).
+4. Če je bila provizija pobrana, ti **pošlje Telegram sporočilo** s točnim
+   zneskom in povezavo do potrdila (transakcija na Solscanu).
 
-Nobenega ugibanja, nobenega notranjega dostopa. Samo bere javni zapis in
-odšteva.
+Nobenega ugibanja, nobenega notranjega dostopa. Bere javni zapis in prepozna
+specifično dejanje "poberi provizijo ustvarjalca".
 
 ## 4. Uporaba — ima gumbe!
 
@@ -60,9 +64,9 @@ Raje tipkaš? Ukazi še vedno delujejo:
 - **Ne** dotika se tvojega denarja ali ključev. Samo *bere* javne podatke.
   Sredstev dobesedno ne more premikati — nikoli ne zahteva zasebnega ključa.
 - **Ne** napoveduje ničesar. Poroča o tem, kar se je že zgodilo.
-- Privzeto šteje **vsak prejeti SOL** kot "provizijo". Če denarnica prejme SOL iz
-  kakšnega drugega razloga, to še vedno šteje. (To se da kasneje zožiti samo na
-  specifične transakcije pobiranja provizij.)
+- Sproži se **samo ob pravih pump.fun provizijah ustvarjalca** — dejanskem
+  navodilu `collect_coin_creator_fee` / `collect_creator_fee`. Navadna
+  nakazila, nakupi in prodaje ne sprožijo obvestila.
 
 ## 6. Nastavitve, ki jih lahko prilagodiš
 

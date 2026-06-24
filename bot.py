@@ -42,6 +42,37 @@ MIN_SOL = float(os.environ.get("MIN_SOL", "0"))
 LAMPORTS_PER_SOL = 1_000_000_000
 DB_PATH = Path(__file__).with_name("subscriptions.json")
 
+# --- pump.fun creator-fee detection --------------------------------------- #
+# A "creator fee claim" is a transaction that invokes one of pump.fun's
+# programs with its creator-fee-collect instruction. We fingerprint those
+# instructions by program ID + the 8-byte Anchor discriminator (the unique
+# hash prefix of the instruction name). This is what makes the bot fire on
+# REAL fee claims instead of any random SOL deposit.
+PUMP_BONDING_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+PUMP_AMM_PROGRAM = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
+PUMP_PROGRAMS = {PUMP_BONDING_PROGRAM, PUMP_AMM_PROGRAM}
+
+# discriminator bytes -> human label
+#   collect_coin_creator_fee  (PumpSwap AMM, migrated coins)
+#   collect_creator_fee       (bonding curve, pre-migration coins)
+FEE_DISCRIMINATORS = {
+    bytes.fromhex("a039592ab58b2b42"): "PumpSwap AMM",
+    bytes.fromhex("1416567bc61cdb84"): "bonding curve",
+}
+
+_B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+_B58_INDEX = {c: i for i, c in enumerate(_B58_ALPHABET)}
+
+
+def b58decode(s: str) -> bytes:
+    """Minimal base58 decode (no external dependency)."""
+    n = 0
+    for ch in s:
+        n = n * 58 + _B58_INDEX[ch]
+    body = n.to_bytes((n.bit_length() + 7) // 8, "big") if n else b""
+    pad = len(s) - len(s.lstrip("1"))
+    return b"\x00" * pad + body
+
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO
 )
@@ -145,13 +176,55 @@ def sol_delta_from_tx(tx: dict, wallet: str) -> float:
     return 0.0
 
 
-async def get_sol_delta(client, signature, wallet):
-    tx = await rpc(
+def _iter_instructions(tx: dict):
+    """Every instruction in the tx — top-level plus inner (CPI) instructions."""
+    msg = tx.get("transaction", {}).get("message", {})
+    for ix in msg.get("instructions", []) or []:
+        yield ix
+    for inner in tx.get("meta", {}).get("innerInstructions", []) or []:
+        for ix in inner.get("instructions", []) or []:
+            yield ix
+
+
+def creator_fee_claim_kind(tx: dict):
+    """
+    Return 'PumpSwap AMM' / 'bonding curve' if this tx contains a pump.fun
+    creator-fee-collect instruction, else None. Pure function (testable).
+    """
+    if not tx:
+        return None
+    for ix in _iter_instructions(tx):
+        if ix.get("programId") not in PUMP_PROGRAMS:
+            continue
+        data = ix.get("data")
+        if not data:
+            continue
+        try:
+            disc = b58decode(data)[:8]
+        except Exception:  # noqa: BLE001 — malformed data, just skip
+            continue
+        if disc in FEE_DISCRIMINATORS:
+            return FEE_DISCRIMINATORS[disc]
+    return None
+
+
+def detect_fee_claim(tx: dict, wallet: str):
+    """
+    (amount_sol, kind) if `tx` is a pump.fun creator-fee claim that paid SOL to
+    `wallet`; otherwise (0.0, None). Pure function (testable, no network).
+    """
+    kind = creator_fee_claim_kind(tx)
+    if not kind:
+        return 0.0, None
+    return sol_delta_from_tx(tx, wallet), kind
+
+
+async def get_tx(client, signature):
+    return await rpc(
         client,
         "getTransaction",
         [signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}],
     )
-    return sol_delta_from_tx(tx, wallet)
 
 
 # --------------------------------------------------------------------------- #
@@ -189,21 +262,23 @@ async def poll_wallets(context: ContextTypes.DEFAULT_TYPE):
                 if s.get("err"):  # skip failed txs
                     continue
                 try:
-                    delta = await get_sol_delta(client, s["signature"], wallet)
+                    tx = await get_tx(client, s["signature"])
                 except Exception as e:  # noqa: BLE001
                     log.warning("tx fetch failed %s: %s", s["signature"], e)
                     continue
-                if delta > MIN_SOL and delta > 0:
-                    await notify(context, info["subscribers"], wallet, delta, s["signature"])
+                amount, kind = detect_fee_claim(tx, wallet)
+                if kind and amount > MIN_SOL and amount > 0:
+                    await notify(context, info["subscribers"], wallet, amount,
+                                 s["signature"], kind)
 
             info["last_sig"] = sigs[0]["signature"]
 
     save_db(db)
 
 
-async def notify(context, subscribers, wallet, amount, signature):
+async def notify(context, subscribers, wallet, amount, signature, kind):
     text = (
-        f"💰 *Fee collected*\n"
+        f"💰 *Creator fee collected* (pump.fun · {kind})\n"
         f"Wallet `{short(wallet)}` just received *{amount:.6f} SOL*\n\n"
         f"[View transaction](https://solscan.io/tx/{signature})"
     )
@@ -233,17 +308,20 @@ def main_menu() -> InlineKeyboardMarkup:
 
 
 WELCOME = (
-    "👋 *Solana Fee Notifier*\n\n"
-    "I watch Solana wallets and ping you the moment one *receives SOL* "
-    "(i.e. takes a fee).\n\n"
+    "👋 *pump.fun Creator-Fee Notifier*\n\n"
+    "I watch creator wallets and ping you the moment one *claims its pump.fun "
+    "creator fees*.\n\n"
     "Tap a button below, or type `/track <wallet>`."
 )
 
 HELP_TEXT = (
     "*How it works*\n"
-    "1. Give me a wallet address.\n"
+    "1. Give me a creator's wallet address.\n"
     "2. I check it every ~30s.\n"
-    "3. When it receives SOL, you get a 💰 alert with the amount + a link.\n\n"
+    "3. When that wallet collects pump.fun creator fees, you get a 💰 alert "
+    "with the SOL amount + a link.\n\n"
+    "I detect the real *collect creator fee* instruction (both bonding-curve "
+    "and PumpSwap AMM coins) — not random deposits.\n\n"
     "*Buttons*\n"
     "➕ Track a wallet — then paste the address\n"
     "📋 My wallets — see / remove what you watch\n\n"

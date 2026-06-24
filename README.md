@@ -1,8 +1,8 @@
-# Solana fee-wallet notifier (Telegram bot)
+# pump.fun creator-fee notifier (Telegram bot)
 
-Give the bot a Solana wallet address. Whenever that wallet **receives SOL**
-(i.e. "takes the fee"), everyone subscribed to it gets a Telegram ping with the
-amount and a Solscan link.
+Give the bot a creator's Solana wallet address. Whenever that wallet **claims
+its pump.fun creator fees**, everyone subscribed to it gets a Telegram ping with
+the SOL amount and a Solscan link.
 
 **Normie-friendly:** it has tap **buttons** (➕ Track, 📋 My wallets, 🗑 Remove) —
 no need to memorise commands. See the plain-language whitepapers:
@@ -11,17 +11,28 @@ no need to memorise commands. See the plain-language whitepapers:
 ## How it works
 
 A background job polls each tracked wallet's recent transactions. For every new
-transaction it computes the wallet's net SOL change (`postBalance - preBalance`).
-A positive change means the wallet got paid → notification fires.
+transaction it looks for a **pump.fun creator-fee-collect instruction**, matched
+precisely by program ID + the 8-byte Anchor discriminator:
+
+| Coin type            | Program ID                                     | Instruction                |
+|----------------------|------------------------------------------------|----------------------------|
+| Migrated (PumpSwap)  | `pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA`  | `collect_coin_creator_fee` |
+| Bonding curve        | `6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P`  | `collect_creator_fee`      |
+
+When such an instruction is present **and** the watched wallet's SOL balance
+went up, that's a real creator-fee claim → notification fires. Plain transfers,
+buys, and sells are ignored.
 
 ## Tests
 
 ```bash
 python test_bot.py
 ```
-Covers address validation, the SOL-delta fee-detection math, subscription
-add/remove, and that the buttons + commands are wired up. The detection logic
-was also live-checked against Solana mainnet.
+Covers address validation, the SOL-delta math, **pump.fun claim detection for
+both AMM and bonding-curve coins**, that plain transfers / non-claim pump trades
+are correctly ignored, base58 decoding, subscription add/remove, and that the
+buttons + commands are wired up. The detection was also validated against real
+claims on Solana mainnet.
 
 ## Setup
 
@@ -68,8 +79,7 @@ was also live-checked against Solana mainnet.
 
 ## What counts as "a fee"?
 
-Right now: **any SOL the wallet receives** (above `MIN_SOL`). This is the
-robust, chain-agnostic definition and covers pump.fun creator-fee claims, since
-those land SOL in the wallet. If you later want to *only* fire on a specific
-pump.fun "collect creator fee" instruction (and ignore other deposits), that's a
-targeted upgrade to `get_sol_delta` — say the word.
+**Specifically a pump.fun creator-fee claim** — a transaction that calls
+`collect_coin_creator_fee` (PumpSwap AMM) or `collect_creator_fee` (bonding
+curve) and credits SOL to the watched wallet. Random deposits, buys, and sells
+do **not** trigger a notification. Set `MIN_SOL` to also ignore dust claims.

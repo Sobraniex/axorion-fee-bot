@@ -62,6 +62,80 @@ def test_unrelated_wallet_is_zero():
     assert bot.sol_delta_from_tx(tx, "FeeWallet") == 0.0
 
 
+def _b58encode(b: bytes) -> str:
+    """Inverse of bot.b58decode — used to build fake instruction data in tests."""
+    n = int.from_bytes(b, "big")
+    out = ""
+    while n:
+        n, r = divmod(n, 58)
+        out = bot._B58_ALPHABET[r] + out
+    pad = len(b) - len(b.lstrip(b"\x00"))
+    return "1" * pad + out
+
+
+def _pump_tx(discriminator_hex: str, program: str, wallet: str,
+             pre_lamports: int, post_lamports: int) -> dict:
+    data = _b58encode(bytes.fromhex(discriminator_hex) + b"\x00" * 4)
+    return {
+        "transaction": {"message": {
+            "accountKeys": [{"pubkey": wallet}],
+            "instructions": [{"programId": program, "accounts": [], "data": data}],
+        }},
+        "meta": {
+            "preBalances": [pre_lamports], "postBalances": [post_lamports],
+            "innerInstructions": [],
+        },
+    }
+
+
+def test_detects_pumpswap_amm_creator_fee_claim():
+    wallet = "GThUX1Atko4tqhN2NaiTazWSeFWMuiUvfFnyJyUghFMJ"
+    tx = _pump_tx("a039592ab58b2b42", bot.PUMP_AMM_PROGRAM, wallet,
+                  1_000_000_000, 1_700_000_000)  # +0.7 SOL
+    amount, kind = bot.detect_fee_claim(tx, wallet)
+    assert kind == "PumpSwap AMM"
+    assert amount == 0.7
+
+
+def test_detects_bonding_curve_creator_fee_claim():
+    wallet = "GThUX1Atko4tqhN2NaiTazWSeFWMuiUvfFnyJyUghFMJ"
+    tx = _pump_tx("1416567bc61cdb84", bot.PUMP_BONDING_PROGRAM, wallet,
+                  1_000_000_000, 1_250_000_000)  # +0.25 SOL
+    amount, kind = bot.detect_fee_claim(tx, wallet)
+    assert kind == "bonding curve"
+    assert amount == 0.25
+
+
+def test_ignores_plain_sol_transfer_not_a_fee_claim():
+    # SOL arrives, but NO pump.fun fee instruction -> must NOT fire.
+    wallet = "GThUX1Atko4tqhN2NaiTazWSeFWMuiUvfFnyJyUghFMJ"
+    tx = {
+        "transaction": {"message": {
+            "accountKeys": [{"pubkey": wallet}],
+            "instructions": [{"programId": "11111111111111111111111111111111",
+                              "parsed": {"type": "transfer"}, "program": "system"}],
+        }},
+        "meta": {"preBalances": [1_000_000_000], "postBalances": [9_000_000_000],
+                 "innerInstructions": []},
+    }
+    amount, kind = bot.detect_fee_claim(tx, wallet)
+    assert kind is None and amount == 0.0
+
+
+def test_ignores_pump_trade_with_wrong_discriminator():
+    # A pump.fun program call that is NOT a fee-collect (e.g. a buy) -> ignore.
+    wallet = "GThUX1Atko4tqhN2NaiTazWSeFWMuiUvfFnyJyUghFMJ"
+    tx = _pump_tx("deadbeefdeadbeef", bot.PUMP_AMM_PROGRAM, wallet,
+                  1_000_000_000, 1_500_000_000)
+    amount, kind = bot.detect_fee_claim(tx, wallet)
+    assert kind is None
+
+
+def test_b58_roundtrip():
+    blob = bytes.fromhex("a039592ab58b2b42") + b"\x01\x02\x03"
+    assert bot.b58decode(_b58encode(blob)) == blob
+
+
 def test_subscribe_then_list_then_remove():
     chat = 12345
     wallet = "GThUX1Atko4tqhN2NaiTazWSeFWMuiUvfFnyJyUghFMJ"
