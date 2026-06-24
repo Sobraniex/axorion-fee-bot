@@ -1,0 +1,11 @@
+# Secrets — never commit your bot token
+.env
+
+# Local subscription data
+subscriptions.json
+
+# Python
+venv/
+__pycache__/
+*.pyc
+.Python
